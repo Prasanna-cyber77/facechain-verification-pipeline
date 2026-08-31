@@ -1,0 +1,14 @@
+[project]
+name = "facechain-verification"
+version = "0.1.0"
+description = "End-to-end face scan, live reverse-image search, and blockchain verification demo"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "opencv-python-headless>=5.0.0.93",
+    "pillow>=12.3.0",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+facechain = "facechain.cli:main"
