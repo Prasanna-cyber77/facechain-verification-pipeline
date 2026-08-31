@@ -1,8 +1,9 @@
-"""Live reverse-image search using Google Lens' public upload flow."""
+"""Live reverse-image search using public TinEye and Google Lens flows."""
 
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -22,6 +23,187 @@ from .models import SearchResult
 
 class SearchError(RuntimeError):
     """Raised when a live search cannot be completed."""
+
+
+class TinEyeSearch:
+    """Search TinEye's public web endpoint and normalize its result shape."""
+
+    endpoint = "https://tineye.com/api/v1/result_json/"
+    user_agent = "Mozilla/5.0 FaceChain/0.1"
+
+    def __init__(self, timeout_seconds: int = 30) -> None:
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": self.user_agent,
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://tineye.com",
+                "Referer": "https://tineye.com/",
+            }
+        )
+        self.timeout_seconds = timeout_seconds
+
+    def search(self, image_path: Path) -> list[SearchResult]:
+        try:
+            with image_path.open("rb") as image_file:
+                response = self.session.post(
+                    self.endpoint,
+                    files={"image": (image_path.name, image_file, "image/png")},
+                    timeout=self.timeout_seconds,
+                )
+            response.raise_for_status()
+            payload = response.json()
+        except (OSError, requests.RequestException, ValueError) as error:
+            raise SearchError(f"TinEye request failed: {error}") from error
+
+        results: list[SearchResult] = []
+        for match in payload.get("matches", []):
+            if not isinstance(match, dict):
+                continue
+            candidate_image = self._first_string(
+                match, ("image_url", "image", "thumbnail", "thumb_url")
+            )
+            backlinks = match.get("backlinks", [])
+            if not isinstance(backlinks, list):
+                backlinks = []
+            for backlink in backlinks:
+                if not isinstance(backlink, dict):
+                    continue
+                url = self._first_string(backlink, ("backlink", "url", "page_url"))
+                if not url:
+                    continue
+                results.append(
+                    SearchResult(
+                        title=self._first_string(
+                            backlink, ("title", "domain", "url")
+                        )
+                        or "TinEye match",
+                        url=url,
+                        source=self._first_string(
+                            backlink, ("domain", "domain_name")
+                        )
+                        or urlparse(url).netloc.removeprefix("www."),
+                        snippet=self._first_string(
+                            backlink, ("description", "snippet")
+                        )
+                        or "",
+                        image_url=candidate_image,
+                    )
+                )
+        return results[:30]
+
+    @staticmethod
+    def _first_string(value: dict, keys: tuple[str, ...]) -> str | None:
+        for key in keys:
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+        return None
+
+    def resolve_candidate_image(self, result: SearchResult) -> bytes | None:
+        if result.image_url:
+            raw = self._download(result.image_url)
+            if raw:
+                return raw
+        try:
+            response = self.session.get(
+                result.url,
+                headers={"Accept": "text/html,application/xhtml+xml"},
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            return None
+        soup = BeautifulSoup(response.text, "html.parser")
+        for selector in (
+            'meta[property="og:image"]',
+            'meta[name="twitter:image"]',
+            'meta[itemprop="image"]',
+        ):
+            tag = soup.select_one(selector)
+            if tag and tag.get("content"):
+                image_url = urljoin(result.url, tag["content"])
+                raw = self._download(image_url)
+                if raw:
+                    result.image_url = image_url
+                    return raw
+        return None
+
+    def _download(self, url: str) -> bytes | None:
+        try:
+            response = self.session.get(
+                url,
+                headers={"Accept": "image/avif,image/webp,image/*,*/*;q=0.8"},
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            if "image" not in response.headers.get("content-type", "").lower():
+                return None
+            return response.content
+        except requests.RequestException:
+            return None
+
+    def find_matching_post(
+        self,
+        image_path: Path,
+        reference_encoding,
+        *,
+        threshold: float = 0.72,
+        max_candidates: int = 12,
+    ) -> tuple[SearchResult, list[SearchResult]]:
+        return _evaluate_provider(
+            self,
+            image_path,
+            reference_encoding,
+            threshold=threshold,
+            max_candidates=max_candidates,
+        )
+
+
+def _evaluate_provider(
+    provider,
+    image_path: Path,
+    reference_encoding,
+    *,
+    threshold: float,
+    max_candidates: int,
+) -> tuple[SearchResult, list[SearchResult]]:
+    discovered = provider.search(image_path)
+    if not discovered:
+        raise SearchError("Live provider returned no indexed image matches.")
+    image = decode_image(image_path.read_bytes())
+    reference_hash = average_hash(image)
+    evaluated: list[SearchResult] = []
+
+    for result in discovered[:max_candidates]:
+        raw = provider.resolve_candidate_image(result)
+        if not raw:
+            continue
+        try:
+            candidate = decode_image(raw)
+            score, _ = best_face_similarity(reference_encoding, candidate)
+        except FacePipelineError:
+            continue
+        result.match_score = round(score, 4)
+        result.candidate_image_sha256 = hashlib.sha256(raw).hexdigest()
+        candidate_hash = average_hash(candidate)
+        distance = hamming_distance(reference_hash, candidate_hash)
+        if score >= threshold:
+            result.match_method = f"face cosine similarity ({score:.3f})"
+            evaluated.append(result)
+        elif distance <= 8:
+            result.match_method = f"near-duplicate image hash (distance {distance})"
+            result.match_score = round(max(score, 1 - distance / 64), 4)
+            evaluated.append(result)
+
+    if not evaluated:
+        raise SearchError(
+            "Live search returned pages, but none exposed a candidate image "
+            f"that passed the face-match threshold ({threshold:.2f}). "
+            "Review the search result pages or try a better crop."
+        )
+    selected = max(evaluated, key=lambda item: item.match_score or 0)
+    return selected, discovered
 
 
 class GoogleLensSearch:
@@ -212,37 +394,48 @@ class GoogleLensSearch:
         threshold: float = 0.72,
         max_candidates: int = 12,
     ) -> tuple[SearchResult, list[SearchResult]]:
-        discovered = self.search(image_path)
-        image = decode_image(image_path.read_bytes())
-        reference_hash = average_hash(image)
-        evaluated: list[SearchResult] = []
+        return _evaluate_provider(
+            self,
+            image_path,
+            reference_encoding,
+            threshold=threshold,
+            max_candidates=max_candidates,
+        )
 
-        for result in discovered[:max_candidates]:
-            raw = self.resolve_candidate_image(result)
-            if not raw:
-                continue
+
+class CompositeImageSearch:
+    """Try independent live providers without hiding provider failures."""
+
+    def __init__(self, timeout_seconds: int = 30) -> None:
+        self.providers = [
+            TinEyeSearch(timeout_seconds),
+            GoogleLensSearch(timeout_seconds),
+        ]
+
+    def find_matching_post(
+        self,
+        image_path: Path,
+        reference_encoding,
+        *,
+        threshold: float = 0.72,
+        max_candidates: int = 12,
+    ) -> tuple[SearchResult, list[SearchResult]]:
+        failures: list[str] = []
+        all_discovered: list[SearchResult] = []
+        for provider in self.providers:
             try:
-                candidate = decode_image(raw)
-                score, _ = best_face_similarity(reference_encoding, candidate)
-            except FacePipelineError:
-                continue
-            result.match_score = round(score, 4)
-            result.candidate_image_sha256 = __import__("hashlib").sha256(raw).hexdigest()
-            candidate_hash = average_hash(candidate)
-            distance = hamming_distance(reference_hash, candidate_hash)
-            if score >= threshold:
-                result.match_method = f"face cosine similarity ({score:.3f})"
-                evaluated.append(result)
-            elif distance <= 8:
-                result.match_method = f"near-duplicate image hash (distance {distance})"
-                result.match_score = round(max(score, 1 - distance / 64), 4)
-                evaluated.append(result)
-
-        if not evaluated:
-            raise SearchError(
-                "Live search returned pages, but none exposed a candidate image "
-                f"that passed the face-match threshold ({threshold:.2f}). "
-                "Review the search result pages or try a better crop."
-            )
-        selected = max(evaluated, key=lambda item: item.match_score or 0)
-        return selected, discovered
+                selected, discovered = provider.find_matching_post(
+                    image_path,
+                    reference_encoding,
+                    threshold=threshold,
+                    max_candidates=max_candidates,
+                )
+                return selected, discovered
+            except SearchError as error:
+                failures.append(str(error))
+        detail = " | ".join(failures)
+        raise SearchError(
+            "No provider returned a verifiable matching image. "
+            "The search was live, but the result cannot be trusted without "
+            f"image evidence. Provider details: {detail}"
+        )
