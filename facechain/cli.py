@@ -7,9 +7,9 @@ import sys
 import uuid
 from pathlib import Path
 
-from .blockchain import LocalBlockchain, canonical_json, digest
+from .blockchain import LocalBlockchain, digest
 from .face import FacePipelineError, analyze_image
-from .search import GoogleLensSearch, SearchError
+from .search import CompositeImageSearch, SearchError
 
 
 def heading(label: str) -> None:
@@ -24,7 +24,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     print(f"Input scan: {image_path}")
 
     try:
-        scan, image, encoding = analyze_image(image_path)
+        scan, _, encoding = analyze_image(image_path)
     except (OSError, FacePipelineError) as error:
         print(f"\n[FACE DETECTION FAILED] {error}", file=sys.stderr)
         return 2
@@ -37,9 +37,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
     print(f"  Input SHA-256:     {scan.image_sha256[:24]}...")
 
     print("\n[2/3] LIVE WEB / SOCIAL SEARCH")
-    print("  Provider:          Google Lens public upload endpoint")
+    print("  Providers:         TinEye + Google Lens live upload endpoints")
     print("  Hardcoded result:  no")
-    searcher = GoogleLensSearch(timeout_seconds=args.timeout)
+    searcher = CompositeImageSearch(timeout_seconds=args.timeout)
     try:
         selected, discovered = searcher.find_matching_post(
             image_path,
@@ -78,7 +78,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         "method": {
             "face_detector": "OpenCV Haar cascade",
             "face_encoding": "64x64 normalized grayscale descriptor",
-            "web_search": "Google Lens live upload",
+            "web_search": "TinEye + Google Lens live upload",
             "blockchain": "local append-only SHA-256 hash chain",
         },
     }
