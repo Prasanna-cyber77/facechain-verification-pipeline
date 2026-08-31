@@ -13,6 +13,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import requests
 
 from .models import FaceScan
 
@@ -48,17 +49,70 @@ def decode_image(raw: bytes) -> np.ndarray:
 
 def detect_faces(image: np.ndarray) -> list[tuple[int, int, int, int]]:
     grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-    detector = cv2.CascadeClassifier(str(cascade_path))
-    if detector.empty():
-        raise FacePipelineError("OpenCV's bundled face detector could not be loaded.")
-    boxes = detector.detectMultiScale(
-        grayscale,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(48, 48),
+    # OpenCV 4 exposes the classic cascade API; OpenCV 5 removed it from the
+    # Python surface, so keep a YuNet fallback for newer wheels.
+    if hasattr(cv2, "CascadeClassifier"):
+        cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+        detector = cv2.CascadeClassifier(str(cascade_path))
+        if detector.empty():
+            raise FacePipelineError("OpenCV's bundled face detector could not be loaded.")
+        boxes = detector.detectMultiScale(
+            grayscale,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(48, 48),
+        )
+        return [tuple(int(value) for value in box) for box in boxes]
+
+    if not hasattr(cv2, "FaceDetectorYN_create"):
+        raise FacePipelineError(
+            "This OpenCV build has no supported face detector. "
+            "Install OpenCV 4 or a YuNet-capable OpenCV build."
+        )
+    model_path = _ensure_yunet_model()
+    detector = cv2.FaceDetectorYN_create(
+        str(model_path),
+        "",
+        (image.shape[1], image.shape[0]),
+        0.85,
+        0.3,
+        5000,
     )
-    return [tuple(int(value) for value in box) for box in boxes]
+    _, detected = detector.detect(image)
+    if detected is None:
+        return []
+    return [
+        tuple(int(round(value)) for value in face[:4])
+        for face in detected
+        if face[2] >= 1 and face[3] >= 1
+    ]
+
+
+def _ensure_yunet_model() -> Path:
+    model_path = Path(".cache/facechain/face_detection_yunet_2023mar.onnx")
+    if model_path.exists() and model_path.stat().st_size > 100_000:
+        return model_path
+    model_url = (
+        "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/"
+        "face_detection_yunet_2023mar.onnx"
+    )
+    try:
+        response = requests.get(
+            model_url,
+            headers={"User-Agent": "FaceChain/0.1"},
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise FacePipelineError(
+            "YuNet face detector model could not be downloaded. "
+            f"Check network access and retry: {error}"
+        ) from error
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = model_path.with_suffix(".tmp")
+    temporary_path.write_bytes(response.content)
+    temporary_path.replace(model_path)
+    return model_path
 
 
 def _canonical_crop(
