@@ -9,18 +9,20 @@ face scan → face detection + encoding → live web/social reverse-image search
 
 It is intentionally a command-line project so the entire pipeline can be
 recorded in one terminal window. It does not use a hardcoded post. Each run
-uploads the supplied image to Google Lens' public reverse-image search flow,
-evaluates candidate images exposed by the live results, and anchors the selected
-result in a local SHA-256 hash chain.
+uploads the supplied image to TinEye's public reverse-image search flow and
+falls back to Google Lens, evaluates candidate images exposed by the live
+results, and anchors the selected result in a local SHA-256 hash chain.
 
 ## What is implemented
 
-1. **Face identification stage** — OpenCV's bundled Haar cascade detects the
-   largest face. A normalized 64×64 grayscale face descriptor is generated and
-   summarized by a SHA-256 digest.
-2. **Genuine search stage** — the input is uploaded to Google Lens at runtime.
-   External result pages are parsed, candidate images are downloaded, and each
-   candidate is checked for face similarity (or a near-duplicate image hash).
+1. **Face identification stage** — OpenCV detects the largest face using its
+   bundled Haar cascade when available, or downloads the small YuNet detector
+   model for newer OpenCV wheels. A normalized 64×64 grayscale face descriptor
+   is generated and summarized by a SHA-256 digest.
+2. **Genuine search stage** — the input is uploaded to TinEye at runtime, with
+   Google Lens as an independent fallback. External result pages are parsed,
+   candidate images are downloaded, and each candidate is checked for face
+   similarity (or a near-duplicate image hash).
 3. **Blockchain verification stage** — the discovered post metadata, candidate
    image fingerprint, and face-scan fingerprint are appended to
    `data/ledger.json`. Each block includes its own SHA-256 hash and the previous
@@ -49,7 +51,9 @@ python -m facechain run --image /path/to/face-scan.jpg
 
 The input should be a clear JPEG, PNG, or WebP containing one front-facing
 face. The image must be publicly searchable for the live search step to return
-a useful matching post. A run creates `data/ledger.json`.
+a useful matching post. The first run on an OpenCV 5 environment downloads the
+YuNet detector model into `.cache/facechain/`. A run creates
+`data/ledger.json`.
 
 ## Re-verify a previous record
 
@@ -80,9 +84,9 @@ the file afterward.
 - The local descriptor is intentionally lightweight and explainable. It is not
   a production-grade biometric recognition model and should not be used for
   access control, surveillance, or decisions about people.
-- Google Lens result markup and rate limits can change. If its public upload
-  endpoint is unavailable, rerun later or adapt `facechain/search.py` to an
-  authorized reverse-image-search API.
+- TinEye and Google Lens result markup and rate limits can change. If both
+  public upload endpoints are unavailable, rerun later or adapt
+  `facechain/search.py` to an authorized reverse-image-search API.
 - Public social pages may block automated image retrieval. The pipeline fails
   explicitly rather than claiming a match without image evidence.
 - Only use images and web content you have permission to process. Avoid
@@ -94,7 +98,7 @@ the file afterward.
 facechain/
   cli.py          terminal orchestration and recording-friendly output
   face.py         OpenCV detection, encoding, and face comparison
-  search.py       live Google Lens upload and result parsing
+  search.py       live TinEye/Google Lens upload and result parsing
   blockchain.py   local append-only hash chain and verification
   models.py       typed records shared by all stages
 ```
